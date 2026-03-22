@@ -1,61 +1,65 @@
-// ===============================
-// DATASTORAGE BACKEND (CLEAN MVP)
-// ===============================
-
 require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const AWS = require("aws-sdk");
 const multer = require("multer");
+const multerS3 = require("multer-s3");
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ===============================
-// DATABASE
-// ===============================
+// ================= DATABASE =================
 mongoose.connect(process.env.MONGO_URL);
 
 const User = mongoose.model("User", {
   email: String,
   password: String,
   isAdmin: { type: Boolean, default: false },
-  earnings: { type: Number, default: 0 },
-  storageLimit: { type: Number, default: 15 * 1024 * 1024 * 1024 }
+  earnings: { type: Number, default: 0 }
 });
 
 const File = mongoose.model("File", {
   userId: String,
   name: String,
-  link: String,
-  size: Number
+  url: String,
+  link: String
 });
 
-const Withdraw = mongoose.model("Withdraw", {
-  userId: String,
-  amount: Number,
-  status: { type: String, default: "pending" }
+// ================= AWS =================
+const s3 = new AWS.S3({
+  accessKeyId: process.env.AWS_ACCESS_KEY,
+  secretAccessKey: process.env.AWS_SECRET_KEY,
+  region: process.env.AWS_REGION
 });
 
-// ===============================
-// AUTH MIDDLEWARE
-// ===============================
+// ================= AUTH =================
 function auth(req, res, next) {
   try {
-    req.user = jwt.verify(req.headers.authorization, "secret123");
+    req.user = jwt.verify(req.headers.authorization, process.env.JWT_SECRET);
     next();
   } catch {
     res.status(401).send("Unauthorized");
   }
 }
 
-// ===============================
-// REGISTER
-// ===============================
+// ================= MULTER S3 =================
+const upload = multer({
+  storage: multerS3({
+    s3: s3,
+    bucket: process.env.AWS_BUCKET,
+    acl: "public-read",
+    key: function (req, file, cb) {
+      cb(null, Date.now() + "-" + file.originalname);
+    }
+  })
+});
+
+// ================= REGISTER =================
 app.post("/register", async (req, res) => {
   const hash = await bcrypt.hash(req.body.password, 10);
 
@@ -67,11 +71,10 @@ app.post("/register", async (req, res) => {
   res.json(user);
 });
 
-// ===============================
-// LOGIN
-// ===============================
+// ================= LOGIN =================
 app.post("/login", async (req, res) => {
   const user = await User.findOne({ email: req.body.email });
+
   if (!user) return res.status(400).send("User not found");
 
   const valid = await bcrypt.compare(req.body.password, user.password);
@@ -79,128 +82,106 @@ app.post("/login", async (req, res) => {
 
   const token = jwt.sign(
     { id: user._id, isAdmin: user.isAdmin },
-    "secret123"
+    process.env.JWT_SECRET
   );
 
   res.json({ token });
 });
 
-// ===============================
-// FILE UPLOAD (SIMULATED)
-// ===============================
-const upload = multer({ storage: multer.memoryStorage() });
-
+// ================= UPLOAD =================
 app.post("/upload", auth, upload.single("file"), async (req, res) => {
   const link = uuidv4();
 
   await File.create({
     userId: req.user.id,
     name: req.file.originalname,
-    link,
-    size: req.file.size
+    url: req.file.location,
+    link
   });
 
   res.json({
-    url: `https://your-frontend.netlify.app/file/${link}`
+    url: `https://your-backend.onrender.com/file/${link}`
   });
 });
 
-// ===============================
-// FILE DOWNLOAD PAGE
-// ===============================
+// ================= FILE PAGE (AD + TIMER) =================
 app.get("/file/:link", async (req, res) => {
+  const file = await File.findOne({ link: req.params.link });
+
+  if (!file) return res.send("File not found");
+
   res.send(`
-    <html>
-      <body style="text-align:center;font-family:sans-serif;background:#0f172a;color:white">
+  <html>
+  <head>
+    <title>${file.name}</title>
+  </head>
 
-        <h2>File Ready</h2>
+  <body style="text-align:center;font-family:sans-serif;background:#0f172a;color:white">
 
-        <p id="timer">Wait 5 seconds...</p>
+    <h2>${file.name}</h2>
 
-        <a id="download" style="display:none" href="/download/${req.params.link}">
-          Download
-        </a>
+    <!-- Adsterra Ad -->
+    <div style="margin:20px;">
+      <script type="text/javascript">
+        atOptions = {
+          'key' : 'f922c7efba5ee0219441cd2d13d3611a',
+          'format' : 'iframe',
+          'height' : 250,
+          'width' : 300
+        };
+      </script>
+      <script src="//www.topcreativeformat.com/f922c7efba5ee0219441cd2d13d3611a/invoke.js"></script>
+    </div>
 
-        <script>
-          let t = 5;
-          const timer = document.getElementById("timer");
-          const link = document.getElementById("download");
+    <p id="timer">Please wait 8 seconds...</p>
 
-          let interval = setInterval(()=>{
-            t--;
-            timer.innerText = "Wait " + t + " seconds...";
+    <button id="downloadBtn" style="display:none;padding:12px 20px;background:#22c55e;border:none;border-radius:10px">
+      Download File
+    </button>
 
-            if(t <= 0){
-              clearInterval(interval);
-              timer.style.display = "none";
-              link.style.display = "block";
-            }
-          },1000);
-        </script>
+    <script>
+      let time = 8;
+      const timer = document.getElementById("timer");
+      const btn = document.getElementById("downloadBtn");
 
-      </body>
-    </html>
+      let interval = setInterval(() => {
+        time--;
+        timer.innerText = "Please wait " + time + " seconds...";
+
+        if(time <= 0){
+          clearInterval(interval);
+          timer.style.display = "none";
+          btn.style.display = "inline-block";
+        }
+      }, 1000);
+
+      btn.onclick = () => {
+        window.location.href = "/download/${file.link}";
+      };
+    </script>
+
+  </body>
+  </html>
   `);
 });
 
-// ===============================
-// DOWNLOAD FILE (SIMPLIFIED)
-// ===============================
+// ================= DOWNLOAD =================
 app.get("/download/:link", async (req, res) => {
   const file = await File.findOne({ link: req.params.link });
-  res.json(file);
+
+  if (!file) return res.send("File not found");
+
+  res.redirect(file.url);
 });
 
-// ===============================
-// ADMIN APIs
-// ===============================
+// ================= ADMIN =================
 app.get("/admin/users", auth, async (req, res) => {
-  const users = await User.find();
-  res.json(users);
+  res.json(await User.find());
 });
 
 app.get("/admin/files", auth, async (req, res) => {
-  const files = await File.find();
-  res.json(files);
+  res.json(await File.find());
 });
 
-// ===============================
-// EARNINGS
-// ===============================
-app.get("/earnings", auth, async (req, res) => {
-  const user = await User.findById(req.user.id);
-  res.json({ earnings: user.earnings });
-});
-
-// ===============================
-// WITHDRAW
-// ===============================
-app.post("/withdraw", auth, async (req, res) => {
-  await Withdraw.create({
-    userId: req.user.id,
-    amount: req.body.amount
-  });
-
-  res.send("Withdraw request sent");
-});
-
-// ===============================
-// ADMIN APPROVE WITHDRAW
-// ===============================
-app.post("/admin/approve-withdraw/:id", auth, async (req, res) => {
-  const withdraw = await Withdraw.findById(req.params.id);
-  const user = await User.findById(withdraw.userId);
-
-  withdraw.status = "approved";
-  user.earnings -= withdraw.amount;
-
-  await withdraw.save();
-  await user.save();
-
-  res.send("Approved");
-});
-
-// ===============================
-// START SERVER
-// ===============================
+// ================= START =================
 app.listen(5000, () => console.log("Server running on port 5000"));
